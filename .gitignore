@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+# .env can be either the venv directory or a dotenv file in this project;
+# ignore both, plus other common venv layouts and the env.local convention.
+.env
+.env/
+.env.local
+env.local
+.venv/
+venv/
+db.sqlite3
+staticfiles/
+*.log
+.DS_Store
