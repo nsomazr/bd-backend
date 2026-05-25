@@ -2,6 +2,8 @@ from django.urls import path
 
 from .views import (
     AdminArenaListView,
+    AdminConversationDetailView,
+    AdminConversationsListView,
     AdminExportDPOView,
     AdminExportFeedbackView,
     AdminExportRawView,
@@ -9,6 +11,8 @@ from .views import (
     AdminFeedbackListView,
     AdminRegenListView,
     AdminStatsView,
+    AdminVisitorDetailView,
+    AdminVisitorsListView,
     ConversationRegenerateView,
     MessageFeedbackView,
 )
@@ -30,6 +34,22 @@ urlpatterns = [
     path("admin/rlhf/feedback/", AdminFeedbackListView.as_view(), name="rlhf-admin-feedback"),
     path("admin/rlhf/regenerations/", AdminRegenListView.as_view(), name="rlhf-admin-regen"),
     path("admin/rlhf/arena/", AdminArenaListView.as_view(), name="rlhf-admin-arena"),
+    path("admin/rlhf/visitors/", AdminVisitorsListView.as_view(), name="rlhf-admin-visitors"),
+    path(
+        "admin/rlhf/visitors/<str:visitor_key>/",
+        AdminVisitorDetailView.as_view(),
+        name="rlhf-admin-visitor-detail",
+    ),
+    path(
+        "admin/rlhf/conversations/",
+        AdminConversationsListView.as_view(),
+        name="rlhf-admin-conversations",
+    ),
+    path(
+        "admin/rlhf/conversations/<str:public_id>/",
+        AdminConversationDetailView.as_view(),
+        name="rlhf-admin-conversation-detail",
+    ),
     # Admin exports
     path("admin/rlhf/exports/dpo.jsonl", AdminExportDPOView.as_view(), name="rlhf-export-dpo"),
     path(

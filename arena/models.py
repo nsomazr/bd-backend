@@ -16,6 +16,15 @@ class ArenaBattle(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="arena_battles",
+        null=True,
+        blank=True,
+    )
+    guest = models.ForeignKey(
+        "accounts.GuestVisitor",
+        on_delete=models.CASCADE,
+        related_name="arena_battles",
+        null=True,
+        blank=True,
     )
     prompt = models.TextField()
     model_a_key = models.CharField(max_length=64)
@@ -28,7 +37,10 @@ class ArenaBattle(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
-        indexes = [models.Index(fields=["user", "-created_at"])]
+        indexes = [
+            models.Index(fields=["user", "-created_at"]),
+            models.Index(fields=["guest", "-created_at"]),
+        ]
 
     def __str__(self) -> str:
         return f"Battle#{self.pk} {self.model_a_key} vs {self.model_b_key}"

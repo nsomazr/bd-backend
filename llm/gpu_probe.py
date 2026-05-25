@@ -76,6 +76,13 @@ def probe_gpu(my_pid: int | None = None) -> GpuProbeResult:
                 result.memory_total_mib = int(float(row[1]))
                 result.memory_used_mib = int(float(row[2]))
                 result.memory_free_mib = int(float(row[3]))
+        elif proc.stderr and "Driver/library version mismatch" in proc.stderr:
+            result.notes.append(
+                "NVIDIA driver/library version mismatch: the loaded kernel module "
+                "does not match the installed driver packages (often after an apt "
+                "upgrade without reboot). Reboot the server, or reload the nvidia "
+                "modules with sudo, then restart bd-backend."
+            )
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
         result.notes.append("nvidia-smi is not available on this host.")
 

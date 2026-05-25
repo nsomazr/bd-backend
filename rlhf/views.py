@@ -10,10 +10,13 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from accounts.models import GuestVisitor
+from accounts.permissions import RequiresUserOrVisitor
+from accounts.visitors import actor_owner_kwargs, conversation_owner_q
 
 from arena.models import ArenaBattle
 from chat.models import Conversation, Message
@@ -33,6 +36,9 @@ from .exporters import (
 from .models import MessageFeedback, RegenerationPair
 from .permissions import IsStaff
 from .serializers import (
+    AdminConversationSerializer,
+    AdminVisitorDetailSerializer,
+    AdminVisitorSerializer,
     ArenaPairSerializer,
     FeedbackInputSerializer,
     FeedbackSerializer,
@@ -71,23 +77,22 @@ def _sse(data: dict, event: str | None = None) -> bytes:
 class MessageFeedbackView(APIView):
     """POST a thumbs up/down (with optional comment) on a single message."""
 
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (RequiresUserOrVisitor,)
 
     def post(self, request, message_id: int):
+        owner = conversation_owner_q(request.actor)
         msg = get_object_or_404(
-            Message, pk=message_id, conversation__user=request.user
+            Message,
+            pk=message_id,
+            role="assistant",
+            **{f"conversation__{k}": v for k, v in owner.items()},
         )
-        if msg.role != "assistant":
-            return Response(
-                {"detail": "Feedback can only be left on assistant messages."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         serializer = FeedbackInputSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         fb, _ = MessageFeedback.objects.update_or_create(
             message=msg,
             defaults={
-                "user": request.user,
+                **actor_owner_kwargs(request.actor),
                 "rating": serializer.validated_data["rating"],
                 "comment": serializer.validated_data.get("comment", "") or "",
             },
@@ -95,8 +100,10 @@ class MessageFeedbackView(APIView):
         return Response(FeedbackSerializer(fb).data, status=status.HTTP_200_OK)
 
     def delete(self, request, message_id: int):
+        owner = conversation_owner_q(request.actor)
         MessageFeedback.objects.filter(
-            message_id=message_id, message__conversation__user=request.user
+            message_id=message_id,
+            **{f"message__conversation__{k}": v for k, v in owner.items()},
         ).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -111,12 +118,12 @@ class ConversationRegenerateView(APIView):
     capturing (rejected = old assistant message, chosen = new one).
     """
 
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (RequiresUserOrVisitor,)
     renderer_classes = (_SSERenderer, JSONRenderer)
 
     def post(self, request, public_id: str):
         convo = get_object_or_404(
-            Conversation, public_id=public_id, user=request.user
+            Conversation, public_id=public_id, **conversation_owner_q(request.actor)
         )
 
         last_assistant = (
@@ -198,7 +205,7 @@ class ConversationRegenerateView(APIView):
 
             RegenerationPair.objects.create(
                 conversation=convo,
-                user=request.user,
+                **actor_owner_kwargs(request.actor),
                 user_message=last_user,
                 prompt=last_user.content,
                 history=history,
@@ -247,6 +254,18 @@ class AdminStatsView(APIView):
                     "total": _user_count(),
                     "staff": _user_count(is_staff=True),
                 },
+                "visitors": {
+                    "total": GuestVisitor.objects.count(),
+                    "with_conversations": GuestVisitor.objects.filter(
+                        conversations__isnull=False
+                    )
+                    .distinct()
+                    .count(),
+                    "countries": GuestVisitor.objects.exclude(country="")
+                    .values("country")
+                    .distinct()
+                    .count(),
+                },
                 "conversations": Conversation.objects.count(),
                 "messages": Message.objects.count(),
                 "feedback": {
@@ -288,7 +307,7 @@ class AdminFeedbackListView(APIView):
 
     def get(self, request):
         qs = MessageFeedback.objects.select_related(
-            "user", "message", "message__conversation"
+            "user", "guest", "message", "message__conversation"
         )
         rating = request.query_params.get("rating")
         if rating in ("up", "down"):
@@ -299,6 +318,7 @@ class AdminFeedbackListView(APIView):
                 Q(comment__icontains=q)
                 | Q(message__content__icontains=q)
                 | Q(user__email__icontains=q)
+                | Q(guest__visitor_key__icontains=q)
             )
         paginator = _AdminPagination()
         page = paginator.paginate_queryset(qs, request, view=self)
@@ -309,7 +329,7 @@ class AdminRegenListView(APIView):
     permission_classes = (IsStaff,)
 
     def get(self, request):
-        qs = RegenerationPair.objects.select_related("user")
+        qs = RegenerationPair.objects.select_related("user", "guest")
         q = request.query_params.get("q")
         if q:
             qs = qs.filter(
@@ -317,6 +337,7 @@ class AdminRegenListView(APIView):
                 | Q(rejected_text__icontains=q)
                 | Q(chosen_text__icontains=q)
                 | Q(user__email__icontains=q)
+                | Q(guest__visitor_key__icontains=q)
             )
         paginator = _AdminPagination()
         page = paginator.paginate_queryset(qs, request, view=self)
@@ -330,7 +351,7 @@ class AdminArenaListView(APIView):
 
     def get(self, request):
         qs = (
-            ArenaBattle.objects.select_related("user")
+            ArenaBattle.objects.select_related("user", "guest")
             .exclude(vote="")
             .exclude(vote__in=("tie", "both_bad"))
         )
@@ -341,6 +362,7 @@ class AdminArenaListView(APIView):
                 | Q(response_a__icontains=q)
                 | Q(response_b__icontains=q)
                 | Q(user__email__icontains=q)
+                | Q(guest__visitor_key__icontains=q)
             )
         paginator = _AdminPagination()
         page = paginator.paginate_queryset(qs, request, view=self)
@@ -357,9 +379,14 @@ def _arena_to_pair(b: ArenaBattle) -> dict:
     else:
         chosen, chosen_key = b.response_b, b.model_b_key
         rejected, rejected_key = b.response_a, b.model_a_key
+    actor = (
+        b.user.email
+        if b.user_id
+        else f"visitor:{b.guest.visitor_key[:8]}" if b.guest_id else "unknown"
+    )
     return {
         "id": b.id,
-        "user_email": b.user.email,
+        "user_email": actor,
         "prompt": b.prompt,
         "chosen_text": chosen,
         "chosen_model_key": chosen_key,
@@ -451,3 +478,91 @@ class AdminExportRawView(APIView):
         response = StreamingHttpResponse(iter_jsonl(rows), content_type="application/x-ndjson")
         response["Content-Disposition"] = f'attachment; filename="{name}"'
         return response
+
+
+class AdminVisitorsListView(APIView):
+    permission_classes = (IsStaff,)
+
+    def get(self, request):
+        qs = GuestVisitor.objects.annotate(
+            conversation_count=Count("conversations", distinct=True),
+            message_count=Count("conversations__messages", distinct=True),
+        )
+        country = request.query_params.get("country")
+        if country:
+            qs = qs.filter(country__iexact=country)
+        q = request.query_params.get("q")
+        if q:
+            qs = qs.filter(
+                Q(visitor_key__icontains=q)
+                | Q(city__icontains=q)
+                | Q(region__icontains=q)
+                | Q(country__icontains=q)
+                | Q(last_ip__icontains=q)
+                | Q(linked_user__email__icontains=q)
+            )
+        paginator = _AdminPagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        return paginator.get_paginated_response(
+            AdminVisitorSerializer(page, many=True).data
+        )
+
+
+class AdminVisitorDetailView(APIView):
+    permission_classes = (IsStaff,)
+
+    def get(self, request, visitor_key: str):
+        visitor = get_object_or_404(
+            GuestVisitor.objects.annotate(
+                conversation_count=Count("conversations", distinct=True),
+                message_count=Count("conversations__messages", distinct=True),
+            ),
+            visitor_key=visitor_key,
+        )
+        return Response(AdminVisitorDetailSerializer(visitor).data)
+
+
+class AdminConversationsListView(APIView):
+    permission_classes = (IsStaff,)
+
+    def get(self, request):
+        qs = Conversation.objects.select_related("user", "guest").annotate(
+            message_count=Count("messages")
+        )
+        owner = request.query_params.get("owner")
+        if owner == "registered":
+            qs = qs.filter(user__isnull=False)
+        elif owner == "guest":
+            qs = qs.filter(guest__isnull=False)
+        visitor_key = request.query_params.get("visitor_key")
+        if visitor_key:
+            qs = qs.filter(guest__visitor_key=visitor_key)
+        user_email = request.query_params.get("user_email")
+        if user_email:
+            qs = qs.filter(user__email__icontains=user_email)
+        q = request.query_params.get("q")
+        if q:
+            qs = qs.filter(
+                Q(title__icontains=q)
+                | Q(public_id__icontains=q)
+                | Q(user__email__icontains=q)
+                | Q(guest__visitor_key__icontains=q)
+            )
+        paginator = _AdminPagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        return paginator.get_paginated_response(
+            AdminConversationSerializer(page, many=True).data
+        )
+
+
+class AdminConversationDetailView(APIView):
+    permission_classes = (IsStaff,)
+
+    def get(self, request, public_id: str):
+        convo = get_object_or_404(
+            Conversation.objects.select_related("user", "guest").prefetch_related(
+                "messages"
+            ),
+            public_id=public_id,
+        )
+        return Response(AdminConversationSerializer(convo).data)

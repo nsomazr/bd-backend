@@ -11,6 +11,15 @@ class Conversation(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="conversations",
+        null=True,
+        blank=True,
+    )
+    guest = models.ForeignKey(
+        "accounts.GuestVisitor",
+        on_delete=models.CASCADE,
+        related_name="conversations",
+        null=True,
+        blank=True,
     )
     public_id = models.CharField(max_length=16, unique=True, editable=False, db_index=True)
     title = models.CharField(max_length=200, blank=True, default="New chat")
@@ -20,7 +29,10 @@ class Conversation(models.Model):
 
     class Meta:
         ordering = ["-updated_at"]
-        indexes = [models.Index(fields=["user", "-updated_at"])]
+        indexes = [
+            models.Index(fields=["user", "-updated_at"]),
+            models.Index(fields=["guest", "-updated_at"]),
+        ]
 
     def save(self, *args, **kwargs):
         assign_unique_public_id(self)

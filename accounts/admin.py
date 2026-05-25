@@ -1,7 +1,32 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
-from .models import User
+from .models import GuestVisitor, User
+
+
+@admin.register(GuestVisitor)
+class GuestVisitorAdmin(admin.ModelAdmin):
+    list_display = (
+        "visitor_key",
+        "location_label",
+        "visit_count",
+        "last_ip",
+        "linked_user",
+        "last_seen",
+    )
+    search_fields = ("visitor_key", "country", "city", "last_ip", "linked_user__email")
+    readonly_fields = (
+        "visitor_key",
+        "first_seen",
+        "last_seen",
+        "visit_count",
+        "first_ip",
+        "last_ip",
+        "country",
+        "region",
+        "city",
+        "user_agent",
+    )
 
 
 @admin.register(User)

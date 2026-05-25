@@ -35,6 +35,15 @@ class MessageFeedback(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="message_feedback",
+        null=True,
+        blank=True,
+    )
+    guest = models.ForeignKey(
+        "accounts.GuestVisitor",
+        on_delete=models.CASCADE,
+        related_name="message_feedback",
+        null=True,
+        blank=True,
     )
     rating = models.CharField(max_length=8, choices=RATING_CHOICES)
     comment = models.TextField(blank=True, default="")
@@ -69,6 +78,15 @@ class RegenerationPair(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="regeneration_pairs",
+        null=True,
+        blank=True,
+    )
+    guest = models.ForeignKey(
+        "accounts.GuestVisitor",
+        on_delete=models.CASCADE,
+        related_name="regeneration_pairs",
+        null=True,
+        blank=True,
     )
     user_message = models.ForeignKey(
         Message,

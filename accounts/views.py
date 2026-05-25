@@ -5,6 +5,9 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.permissions import AllowAnyWithVisitor
+from accounts.visitors import merge_guest_into_user, resolve_actor
+
 from .serializers import (
     LoginSerializer,
     RegisterSerializer,
@@ -14,12 +17,15 @@ from .serializers import (
 
 
 class RegisterView(APIView):
-    permission_classes = (AllowAny,)
+    permission_classes = (AllowAnyWithVisitor,)
 
     def post(self, request):
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
+        actor = resolve_actor(request)
+        if actor.guest:
+            merge_guest_into_user(actor.guest, user)
         return Response(
             {"user": UserSerializer(user).data, **tokens_for_user(user)},
             status=status.HTTP_201_CREATED,
@@ -27,12 +33,15 @@ class RegisterView(APIView):
 
 
 class LoginView(APIView):
-    permission_classes = (AllowAny,)
+    permission_classes = (AllowAnyWithVisitor,)
 
     def post(self, request):
         serializer = LoginSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         user = serializer.validated_data["user"]
+        actor = resolve_actor(request)
+        if actor.guest:
+            merge_guest_into_user(actor.guest, user)
         return Response({"user": UserSerializer(user).data, **tokens_for_user(user)})
 
 

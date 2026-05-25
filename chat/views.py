@@ -4,27 +4,30 @@ import json
 import logging
 from collections.abc import Iterator
 
-from django.http import Http404, StreamingHttpResponse
+from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.permissions import RequiresUserOrVisitor
+from accounts.visitors import actor_owner_kwargs, conversation_owner_q
 from llm.generator import stream_completion
 from llm.loader import loader
 from llm.registry import DEFAULT_MODEL_KEY, MODEL_REGISTRY
 
+from .models import Conversation, Message
+from .serializers import (
+    ConversationDetailSerializer,
+    ConversationSerializer,
+    MessageSerializer,
+)
+
+logger = logging.getLogger("chat")
+
 
 class ServerSentEventsRenderer(BaseRenderer):
-    """Passthrough renderer so DRF content-negotiation accepts ``text/event-stream``.
-
-    The streaming view returns a :class:`StreamingHttpResponse` directly, so
-    this renderer's ``render`` method is never actually called -- we only need
-    DRF's ``perform_content_negotiation`` to succeed for the request.
-    """
-
     media_type = "text/event-stream"
     format = "sse"
     charset = "utf-8"
@@ -35,15 +38,6 @@ class ServerSentEventsRenderer(BaseRenderer):
         if data is None:
             return b""
         return str(data).encode(self.charset)
-
-from .models import Conversation, Message
-from .serializers import (
-    ConversationDetailSerializer,
-    ConversationSerializer,
-    MessageSerializer,
-)
-
-logger = logging.getLogger("chat")
 
 
 def _sse(data: dict, event: str | None = None) -> bytes:
@@ -56,11 +50,19 @@ def _sse(data: dict, event: str | None = None) -> bytes:
     return "\n".join(parts).encode("utf-8")
 
 
+def _get_conversation(request, public_id: str) -> Conversation:
+    return get_object_or_404(
+        Conversation,
+        public_id=public_id,
+        **conversation_owner_q(request.actor),
+    )
+
+
 class ConversationListCreateView(APIView):
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (RequiresUserOrVisitor,)
 
     def get(self, request):
-        qs = Conversation.objects.filter(user=request.user)
+        qs = Conversation.objects.filter(**conversation_owner_q(request.actor))
         return Response(ConversationSerializer(qs, many=True).data)
 
     def post(self, request):
@@ -68,7 +70,7 @@ class ConversationListCreateView(APIView):
         data.setdefault("model_key", DEFAULT_MODEL_KEY)
         serializer = ConversationSerializer(data=data)
         serializer.is_valid(raise_exception=True)
-        convo = serializer.save(user=request.user)
+        convo = serializer.save(**actor_owner_kwargs(request.actor))
         return Response(
             ConversationSerializer(convo).data,
             status=status.HTTP_201_CREATED,
@@ -76,51 +78,41 @@ class ConversationListCreateView(APIView):
 
 
 class ConversationDetailView(APIView):
-    permission_classes = (IsAuthenticated,)
-
-    def _get_obj(self, request, public_id: str) -> Conversation:
-        return get_object_or_404(
-            Conversation, public_id=public_id, user=request.user
-        )
+    permission_classes = (RequiresUserOrVisitor,)
 
     def get(self, request, public_id: str):
-        convo = self._get_obj(request, public_id)
+        convo = _get_conversation(request, public_id)
         return Response(ConversationDetailSerializer(convo).data)
 
     def patch(self, request, public_id: str):
-        convo = self._get_obj(request, public_id)
+        convo = _get_conversation(request, public_id)
         serializer = ConversationSerializer(convo, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
 
     def delete(self, request, public_id: str):
-        convo = self._get_obj(request, public_id)
+        convo = _get_conversation(request, public_id)
         convo.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ConversationMessagesView(APIView):
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (RequiresUserOrVisitor,)
 
     def get(self, request, public_id: str):
-        convo = get_object_or_404(
-            Conversation, public_id=public_id, user=request.user
-        )
+        convo = _get_conversation(request, public_id)
         return Response(MessageSerializer(convo.messages.all(), many=True).data)
 
 
 class ConversationCompleteView(APIView):
     """POST a user message and receive an SSE stream of assistant tokens."""
 
-    permission_classes = (IsAuthenticated,)
-    # Accept both SSE (for the streamed success path) and JSON (for error responses).
+    permission_classes = (RequiresUserOrVisitor,)
     renderer_classes = (ServerSentEventsRenderer, JSONRenderer)
 
     def post(self, request, public_id: str):
-        convo = get_object_or_404(
-            Conversation, public_id=public_id, user=request.user
-        )
+        convo = _get_conversation(request, public_id)
         content = (request.data.get("content") or "").strip()
         if not content:
             return Response(

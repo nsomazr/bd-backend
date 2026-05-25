@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from collections.abc import Iterator
 from typing import Any
@@ -19,6 +20,74 @@ SYSTEM_PROMPT = (
     "professional or the nearest blood bank."
 )
 
+SWAHILI_HINTS = {
+    "asante",
+    "habari",
+    "tafadhali",
+    "naomba",
+    "samahani",
+    "karibu",
+    "ndio",
+    "hapana",
+    "sawa",
+    "nina",
+    "niko",
+    "nataka",
+    "naweza",
+    "inawezekana",
+    "vipi",
+    "lini",
+    "wapi",
+    "kwanini",
+    "damu",
+    "uchangiaji",
+    "kuchangia",
+    "mchango",
+    "donori",
+    "hospitali",
+    "mgonjwa",
+    "msaada",
+    "afya",
+    "kiswahili",
+    "kingereza",
+}
+
+ENGLISH_HINTS = {
+    "hello",
+    "hi",
+    "please",
+    "thanks",
+    "thank",
+    "blood",
+    "donation",
+    "donate",
+    "donor",
+    "hospital",
+    "help",
+    "health",
+    "can",
+    "should",
+    "would",
+    "what",
+    "when",
+    "where",
+    "why",
+    "english",
+    "swahili",
+}
+
+SWAHILI_OVERRIDE_RE = re.compile(
+    r"\b(reply|respond|answer|write|speak)\s+in\s+swahili\b"
+    r"|\b(jibu|andika|ongea)\s+(kwa\s+)?kiswahili\b",
+    re.I,
+)
+ENGLISH_OVERRIDE_RE = re.compile(
+    r"\b(reply|respond|answer|write|speak)\s+in\s+english\b"
+    r"|\b(jibu|andika|ongea)\s+(kwa\s+)?kingereza\b",
+    re.I,
+)
+WORD_RE = re.compile(r"[a-zA-Z]+")
+
 
 def _effective_max_tokens(requested: int | None) -> int:
     """Use shorter generations on CPU to keep shared-host chat responsive."""
@@ -33,6 +102,60 @@ def _effective_max_tokens(requested: int | None) -> int:
     return default
 
 
+def _detect_language_override(text: str) -> str | None:
+    if SWAHILI_OVERRIDE_RE.search(text):
+        return "sw"
+    if ENGLISH_OVERRIDE_RE.search(text):
+        return "en"
+    return None
+
+
+def _language_score(text: str, hints: set[str]) -> int:
+    tokens = [token.lower() for token in WORD_RE.findall(text)]
+    return sum(1 for token in tokens if token in hints)
+
+
+def _detect_reply_language(messages: list[dict]) -> str:
+    """Infer whether the assistant should answer in English or Swahili."""
+    user_texts = [
+        (m.get("content") or "").strip()
+        for m in messages
+        if m.get("role") == "user" and (m.get("content") or "").strip()
+    ]
+    if not user_texts:
+        return "en"
+
+    latest = user_texts[-1]
+    override = _detect_language_override(latest)
+    if override:
+        return override
+
+    recent = user_texts[-3:]
+    sw_score = 0
+    en_score = 0
+    for idx, text in enumerate(reversed(recent), start=1):
+        weight = len(recent) - idx + 1
+        sw_score += _language_score(text, SWAHILI_HINTS) * weight
+        en_score += _language_score(text, ENGLISH_HINTS) * weight
+
+    if sw_score > en_score:
+        return "sw"
+    return "en"
+
+
+def _system_prompt(messages: list[dict]) -> str:
+    language = _detect_reply_language(messages)
+    if language == "sw":
+        return (
+            f"{SYSTEM_PROMPT} Reply in Swahili unless the user explicitly asks "
+            "you to switch languages."
+        )
+    return (
+        f"{SYSTEM_PROMPT} Reply in English unless the user explicitly asks you "
+        "to switch languages."
+    )
+
+
 def _build_prompt(loaded: LoadedModel, messages: list[dict]) -> str:
     """Return a model-ready prompt string for the given chat history.
 
@@ -40,7 +163,7 @@ def _build_prompt(loaded: LoadedModel, messages: list[dict]) -> str:
     A system prompt is prepended if the caller didn't supply one.
     """
     if not any(m.get("role") == "system" for m in messages):
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
+        messages = [{"role": "system", "content": _system_prompt(messages)}, *messages]
 
     tokenizer = loaded.tokenizer
     try:

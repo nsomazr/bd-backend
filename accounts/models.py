@@ -54,3 +54,40 @@ class User(AbstractBaseUser, PermissionsMixin):
     @property
     def display_name(self) -> str:
         return self.name or self.email.split("@")[0]
+
+
+class GuestVisitor(models.Model):
+    """Anonymous browser identity (UUID from client localStorage)."""
+
+    visitor_key = models.CharField(max_length=36, unique=True, db_index=True)
+    linked_user = models.ForeignKey(
+        "User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="linked_visitors",
+    )
+    first_seen = models.DateTimeField(auto_now_add=True)
+    last_seen = models.DateTimeField(auto_now=True)
+    visit_count = models.PositiveIntegerField(default=1)
+    first_ip = models.GenericIPAddressField(null=True, blank=True)
+    last_ip = models.GenericIPAddressField(null=True, blank=True)
+    country = models.CharField(max_length=64, blank=True, default="")
+    region = models.CharField(max_length=128, blank=True, default="")
+    city = models.CharField(max_length=128, blank=True, default="")
+    user_agent = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-last_seen"]
+        indexes = [
+            models.Index(fields=["-last_seen"]),
+            models.Index(fields=["country"]),
+        ]
+
+    def __str__(self) -> str:
+        return self.visitor_key
+
+    @property
+    def location_label(self) -> str:
+        parts = [p for p in (self.city, self.region, self.country) if p]
+        return ", ".join(parts) if parts else "Unknown"

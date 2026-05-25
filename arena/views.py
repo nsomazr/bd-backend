@@ -8,10 +8,12 @@ from collections.abc import Iterator
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from accounts.permissions import RequiresUserOrVisitor
+from accounts.visitors import actor_owner_kwargs, conversation_owner_q
 
 from llm.generator import stream_completion
 from llm.loader import loader
@@ -68,7 +70,7 @@ class ArenaBattleCreateView(APIView):
     convention -- a future v2 can mask them server-side).
     """
 
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (RequiresUserOrVisitor,)
     renderer_classes = (ServerSentEventsRenderer, JSONRenderer)
 
     def post(self, request):
@@ -83,10 +85,10 @@ class ArenaBattleCreateView(APIView):
         model_a, model_b = _pick_two_models()
 
         battle = ArenaBattle.objects.create(
-            user=request.user,
             prompt=prompt,
             model_a_key=model_a,
             model_b_key=model_b,
+            **actor_owner_kwargs(request.actor),
         )
 
         history = [{"role": "user", "content": prompt}]
@@ -142,10 +144,11 @@ class ArenaBattleCreateView(APIView):
 class ArenaBattleVoteView(APIView):
     """POST /api/arena/battles/<id>/vote/  body: {"vote": "a"|"b"|"tie"|"both_bad"}."""
 
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (RequiresUserOrVisitor,)
 
     def post(self, request, pk: int):
-        battle = get_object_or_404(ArenaBattle, pk=pk, user=request.user)
+        owner = conversation_owner_q(request.actor)
+        battle = get_object_or_404(ArenaBattle, pk=pk, **owner)
         if battle.vote:
             return Response(
                 {"detail": "Vote already recorded for this battle."},
