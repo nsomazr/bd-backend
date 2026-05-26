@@ -86,6 +86,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "rest_framework_simplejwt",
+    "drf_spectacular",
     "corsheaders",
     "accounts",
     "chat",
@@ -161,6 +162,7 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": (
         "rest_framework.permissions.IsAuthenticated",
     ),
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_RENDERER_CLASSES": (
         "rest_framework.renderers.JSONRenderer",
     ),
@@ -242,6 +244,23 @@ LLM_DEVICE = os.getenv("LLM_DEVICE", "auto")
 LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "512"))
 LLM_MAX_NEW_TOKENS_CPU = int(os.getenv("LLM_MAX_NEW_TOKENS_CPU", "256"))
 LLM_CPU_THREADS = int(os.getenv("LLM_CPU_THREADS", "0"))
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Maisha Chat API",
+    "DESCRIPTION": (
+        "OpenAPI documentation for the Maisha blood donation assistant backend. "
+        "Guest flows use the `X-Visitor-Id` header to keep anonymous sessions "
+        "stable across app launches. Authenticated flows use JWT Bearer tokens."
+    ),
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "SCHEMA_PATH_PREFIX": r"/api",
+    "SWAGGER_UI_SETTINGS": {
+        "persistAuthorization": True,
+        "displayRequestDuration": True,
+    },
+    "COMPONENT_SPLIT_REQUEST": True,
+}
 
 LOGGING = {
     "version": 1,

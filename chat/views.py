@@ -6,6 +6,8 @@ from collections.abc import Iterator
 
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.response import Response
@@ -13,7 +15,12 @@ from rest_framework.views import APIView
 
 from accounts.permissions import RequiresUserOrVisitor
 from accounts.visitors import actor_owner_kwargs, conversation_owner_q
-from llm.generator import stream_completion
+from bd_backend.api_schema import (
+    ConversationCompleteRequestSerializer,
+    ConversationCreateRequestSerializer,
+    VISITOR_ID_HEADER,
+)
+from llm.generator import stream_completion, user_facing_generation_error
 from llm.loader import loader
 from llm.registry import DEFAULT_MODEL_KEY, MODEL_REGISTRY
 
@@ -61,10 +68,23 @@ def _get_conversation(request, public_id: str) -> Conversation:
 class ConversationListCreateView(APIView):
     permission_classes = (RequiresUserOrVisitor,)
 
+    @extend_schema(
+        summary="List conversations",
+        description="List the current user's or guest visitor's conversations.",
+        parameters=[VISITOR_ID_HEADER],
+        responses={200: ConversationSerializer(many=True)},
+    )
     def get(self, request):
         qs = Conversation.objects.filter(**conversation_owner_q(request.actor))
         return Response(ConversationSerializer(qs, many=True).data)
 
+    @extend_schema(
+        summary="Create conversation",
+        description="Create a new conversation for the current user or guest visitor.",
+        parameters=[VISITOR_ID_HEADER],
+        request=ConversationCreateRequestSerializer,
+        responses={201: ConversationSerializer},
+    )
     def post(self, request):
         data = dict(request.data)
         data.setdefault("model_key", DEFAULT_MODEL_KEY)
@@ -80,10 +100,21 @@ class ConversationListCreateView(APIView):
 class ConversationDetailView(APIView):
     permission_classes = (RequiresUserOrVisitor,)
 
+    @extend_schema(
+        summary="Get conversation",
+        parameters=[VISITOR_ID_HEADER],
+        responses={200: ConversationDetailSerializer},
+    )
     def get(self, request, public_id: str):
         convo = _get_conversation(request, public_id)
         return Response(ConversationDetailSerializer(convo).data)
 
+    @extend_schema(
+        summary="Update conversation",
+        parameters=[VISITOR_ID_HEADER],
+        request=ConversationCreateRequestSerializer,
+        responses={200: ConversationSerializer},
+    )
     def patch(self, request, public_id: str):
         convo = _get_conversation(request, public_id)
         serializer = ConversationSerializer(convo, data=request.data, partial=True)
@@ -91,6 +122,11 @@ class ConversationDetailView(APIView):
         serializer.save()
         return Response(serializer.data)
 
+    @extend_schema(
+        summary="Delete conversation",
+        parameters=[VISITOR_ID_HEADER],
+        responses={204: None},
+    )
     def delete(self, request, public_id: str):
         convo = _get_conversation(request, public_id)
         convo.delete()
@@ -100,6 +136,11 @@ class ConversationDetailView(APIView):
 class ConversationMessagesView(APIView):
     permission_classes = (RequiresUserOrVisitor,)
 
+    @extend_schema(
+        summary="List conversation messages",
+        parameters=[VISITOR_ID_HEADER],
+        responses={200: MessageSerializer(many=True)},
+    )
     def get(self, request, public_id: str):
         convo = _get_conversation(request, public_id)
         return Response(MessageSerializer(convo.messages.all(), many=True).data)
@@ -111,6 +152,35 @@ class ConversationCompleteView(APIView):
     permission_classes = (RequiresUserOrVisitor,)
     renderer_classes = (ServerSentEventsRenderer, JSONRenderer)
 
+    @extend_schema(
+        summary="Stream assistant reply",
+        description=(
+            "Send a user message and receive a Server-Sent Events stream. "
+            "The stream emits `start`, `model_ready`, `token`, `done`, and "
+            "`error` events."
+        ),
+        parameters=[VISITOR_ID_HEADER],
+        request=ConversationCompleteRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=OpenApiTypes.STR,
+                description="SSE stream with assistant tokens.",
+                examples=[
+                    OpenApiExample(
+                        "SSE sample",
+                        value=(
+                            "event: start\n"
+                            'data: {"conversation_id":"abc123","user_message_id":1,"model_key":"gemma4-e4b"}\n\n'
+                            "event: token\n"
+                            'data: {"delta":"Hello"}\n\n'
+                            "event: done\n"
+                            'data: {"assistant_message_id":2,"content":"Hello"}\n\n'
+                        ),
+                    )
+                ],
+            )
+        },
+    )
     def post(self, request, public_id: str):
         convo = _get_conversation(request, public_id)
         content = (request.data.get("content") or "").strip()
@@ -120,13 +190,15 @@ class ConversationCompleteView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        previous_model = convo.model_key
         requested_model = request.data.get("model_key") or convo.model_key
         if requested_model not in MODEL_REGISTRY:
             return Response(
                 {"detail": f"Unknown model_key: {requested_model}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if requested_model != convo.model_key:
+        model_switched = requested_model != previous_model
+        if model_switched:
             convo.model_key = requested_model
 
         user_msg = Message.objects.create(
@@ -156,14 +228,17 @@ class ConversationCompleteView(APIView):
             )
             collected: list[str] = []
             try:
-                loaded = loader.get(requested_model)
-                yield _sse({"model_key": requested_model}, event="model_ready")
-                for chunk in stream_completion(loaded, history):
-                    collected.append(chunk)
-                    yield _sse({"delta": chunk}, event="token")
+                with loader.session(
+                    requested_model,
+                    unload_if_idle=model_switched,
+                ) as loaded:
+                    yield _sse({"model_key": requested_model}, event="model_ready")
+                    for chunk in stream_completion(loaded, history):
+                        collected.append(chunk)
+                        yield _sse({"delta": chunk}, event="token")
             except BaseException as exc:
                 logger.exception("Streaming failed")
-                yield _sse({"error": str(exc)}, event="error")
+                yield _sse({"error": user_facing_generation_error(exc)}, event="error")
                 return
             full_text = "".join(collected).strip()
             assistant_msg = Message.objects.create(

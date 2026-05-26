@@ -14,6 +14,7 @@ from __future__ import annotations
 import gc
 import logging
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,12 +27,18 @@ from .runtime import configure_cpu_runtime, resolve_inference_target
 logger = logging.getLogger("llm")
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "cuda out of memory" in message or "cuda error: out of memory" in message
+
+
 @dataclass
 class LoadedModel:
     key: str
     tokenizer: Any
     model: Any
     family: str
+    device_label: str
 
 
 _GPU_INITIALISED = False
@@ -140,6 +147,8 @@ class _LazySingleActiveLoader:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._current: LoadedModel | None = None
+        self._active_key: str | None = None
+        self._active_count = 0
 
     @property
     def current_key(self) -> str | None:
@@ -150,14 +159,81 @@ class _LazySingleActiveLoader:
             if self._current and self._current.key == model_key:
                 return self._current
             self._unload_locked()
-            self._current = self._load_locked(model_key)
+            self._current = self._load_with_cpu_fallback_locked(model_key)
             return self._current
+
+    def acquire(self, model_key: str) -> LoadedModel:
+        with self._lock:
+            if not self._current or self._current.key != model_key:
+                self._unload_locked()
+                self._current = self._load_with_cpu_fallback_locked(model_key)
+            self._active_key = model_key
+            self._active_count += 1
+            return self._current
+
+    def release(self, model_key: str, *, unload_if_idle: bool = False) -> None:
+        with self._lock:
+            if not self._current or self._current.key != model_key:
+                return
+            if self._active_key == model_key and self._active_count > 0:
+                self._active_count -= 1
+                if self._active_count == 0:
+                    self._active_key = None
+            if unload_if_idle and self._active_count == 0:
+                self._unload_locked()
+
+    @contextmanager
+    def session(self, model_key: str, *, unload_if_idle: bool = False):
+        loaded = self.acquire(model_key)
+        try:
+            yield loaded
+        finally:
+            self.release(model_key, unload_if_idle=unload_if_idle)
 
     def unload(self) -> None:
         with self._lock:
             self._unload_locked()
 
-    def _unload_locked(self) -> None:
+    def fallback_to_cpu(self, model_key: str) -> LoadedModel:
+        with self._lock:
+            if self._current and self._current.key == model_key:
+                if self._current.device_label == "cpu":
+                    return self._current
+                active_key = self._active_key
+                active_count = self._active_count
+                self._unload_locked(reset_usage=False)
+                self._current = self._load_locked(model_key, force_device="cpu")
+                self._active_key = active_key
+                self._active_count = active_count
+                return self._current
+            self._unload_locked()
+            self._current = self._load_locked(model_key, force_device="cpu")
+            return self._current
+
+    def _cleanup_failed_load_locked(self) -> None:
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # pragma: no cover
+            pass
+
+    def _load_with_cpu_fallback_locked(self, model_key: str) -> LoadedModel:
+        try:
+            return self._load_locked(model_key)
+        except BaseException as exc:
+            if not _is_cuda_oom(exc):
+                raise
+            logger.warning(
+                "CUDA OOM while loading model %s; retrying load on CPU.",
+                model_key,
+            )
+            self._cleanup_failed_load_locked()
+            return self._load_locked(model_key, force_device="cpu")
+
+    def _unload_locked(self, *, reset_usage: bool = True) -> None:
         if not self._current:
             return
         logger.info("Unloading model %s", self._current.key)
@@ -175,8 +251,11 @@ class _LazySingleActiveLoader:
                 torch.cuda.empty_cache()
         except Exception:  # pragma: no cover
             pass
+        if reset_usage:
+            self._active_key = None
+            self._active_count = 0
 
-    def _load_locked(self, model_key: str) -> LoadedModel:
+    def _load_locked(self, model_key: str, force_device: str | None = None) -> LoadedModel:
         _init_gpu_runtime()
         spec = get_spec(model_key)
         import time
@@ -193,7 +272,11 @@ class _LazySingleActiveLoader:
             tokenizer.pad_token = tokenizer.eos_token
 
         dtype = _auto_dtype()
-        device_map, device_label = resolve_inference_target()
+        if force_device == "cpu":
+            device_map, device_label = "cpu", "cpu"
+            logger.warning("Retrying model %s on CPU after GPU failure.", model_key)
+        else:
+            device_map, device_label = resolve_inference_target()
         if device_label == "cpu":
             configure_cpu_runtime()
             dtype = torch.float32
@@ -279,7 +362,13 @@ class _LazySingleActiveLoader:
                 elapsed,
             )
 
-        return LoadedModel(key=model_key, tokenizer=tokenizer, model=model, family=family)
+        return LoadedModel(
+            key=model_key,
+            tokenizer=tokenizer,
+            model=model,
+            family=family,
+            device_label=device_label,
+        )
 
 
 loader = _LazySingleActiveLoader()

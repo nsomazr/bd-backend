@@ -8,6 +8,8 @@ from django.db.models import Count, Q
 from django.http import StreamingHttpResponse, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.renderers import BaseRenderer, JSONRenderer
@@ -17,6 +19,8 @@ from rest_framework.views import APIView
 from accounts.models import GuestVisitor
 from accounts.permissions import RequiresUserOrVisitor
 from accounts.visitors import actor_owner_kwargs, conversation_owner_q
+from bd_backend.api_schema import ConversationRegenerateRequestSerializer, VISITOR_ID_HEADER
+from llm.generator import user_facing_generation_error
 
 from arena.models import ArenaBattle
 from chat.models import Conversation, Message
@@ -79,6 +83,12 @@ class MessageFeedbackView(APIView):
 
     permission_classes = (RequiresUserOrVisitor,)
 
+    @extend_schema(
+        summary="Submit message feedback",
+        parameters=[VISITOR_ID_HEADER],
+        request=FeedbackInputSerializer,
+        responses={200: FeedbackSerializer},
+    )
     def post(self, request, message_id: int):
         owner = conversation_owner_q(request.actor)
         msg = get_object_or_404(
@@ -99,6 +109,11 @@ class MessageFeedbackView(APIView):
         )
         return Response(FeedbackSerializer(fb).data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        summary="Delete message feedback",
+        parameters=[VISITOR_ID_HEADER],
+        responses={204: None},
+    )
     def delete(self, request, message_id: int):
         owner = conversation_owner_q(request.actor)
         MessageFeedback.objects.filter(
@@ -121,6 +136,34 @@ class ConversationRegenerateView(APIView):
     permission_classes = (RequiresUserOrVisitor,)
     renderer_classes = (_SSERenderer, JSONRenderer)
 
+    @extend_schema(
+        summary="Regenerate latest assistant reply",
+        description=(
+            "Regenerate the latest assistant reply and receive a Server-Sent "
+            "Events stream. Useful for retry UX and RLHF data collection."
+        ),
+        parameters=[VISITOR_ID_HEADER],
+        request=ConversationRegenerateRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=OpenApiTypes.STR,
+                description="SSE stream with regenerated response tokens.",
+                examples=[
+                    OpenApiExample(
+                        "Regenerate SSE sample",
+                        value=(
+                            "event: start\n"
+                            'data: {"conversation_id":"abc123","rejected_message_id":9,"model_key":"gemma4-e4b"}\n\n'
+                            "event: token\n"
+                            'data: {"delta":"Updated"}\n\n'
+                            "event: done\n"
+                            'data: {"assistant_message_id":10,"rejected_message_id":9,"content":"Updated reply"}\n\n'
+                        ),
+                    )
+                ],
+            )
+        },
+    )
     def post(self, request, public_id: str):
         convo = get_object_or_404(
             Conversation, public_id=public_id, **conversation_owner_q(request.actor)
@@ -148,12 +191,14 @@ class ConversationRegenerateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        previous_model = convo.model_key
         requested_model = request.data.get("model_key") or last_assistant.model_key or convo.model_key
         if requested_model not in MODEL_REGISTRY:
             return Response(
                 {"detail": f"Unknown model_key: {requested_model}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        model_switched = requested_model != previous_model
 
         # History to feed the model: everything strictly before the assistant
         # message we are about to replace.
@@ -176,14 +221,17 @@ class ConversationRegenerateView(APIView):
             )
             collected: list[str] = []
             try:
-                loaded = loader.get(requested_model)
-                yield _sse({"model_key": requested_model}, event="model_ready")
-                for chunk in stream_completion(loaded, history):
-                    collected.append(chunk)
-                    yield _sse({"delta": chunk}, event="token")
+                with loader.session(
+                    requested_model,
+                    unload_if_idle=model_switched,
+                ) as loaded:
+                    yield _sse({"model_key": requested_model}, event="model_ready")
+                    for chunk in stream_completion(loaded, history):
+                        collected.append(chunk)
+                        yield _sse({"delta": chunk}, event="token")
             except BaseException as exc:
                 logger.exception("Regeneration failed")
-                yield _sse({"error": str(exc)}, event="error")
+                yield _sse({"error": user_facing_generation_error(exc)}, event="error")
                 return
 
             full_text = "".join(collected).strip()
@@ -242,6 +290,11 @@ class _AdminPagination(PageNumberPagination):
 class AdminStatsView(APIView):
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_stats",
+        summary="Get RLHF admin stats",
+        responses={200: OpenApiTypes.OBJECT},
+    )
     def get(self, request):
         arena_qs = ArenaBattle.objects.exclude(vote="")
         feedback_counts = MessageFeedback.objects.values("rating").annotate(
@@ -305,6 +358,17 @@ def _dpo_count() -> int:
 class AdminFeedbackListView(APIView):
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_feedback_list",
+        summary="List feedback records",
+        parameters=[
+            OpenApiParameter("page", int, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("page_size", int, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("rating", str, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("q", str, OpenApiParameter.QUERY, required=False),
+        ],
+        responses={200: OpenApiTypes.OBJECT},
+    )
     def get(self, request):
         qs = MessageFeedback.objects.select_related(
             "user", "guest", "message", "message__conversation"
@@ -328,6 +392,16 @@ class AdminFeedbackListView(APIView):
 class AdminRegenListView(APIView):
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_regeneration_list",
+        summary="List regeneration pairs",
+        parameters=[
+            OpenApiParameter("page", int, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("page_size", int, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("q", str, OpenApiParameter.QUERY, required=False),
+        ],
+        responses={200: OpenApiTypes.OBJECT},
+    )
     def get(self, request):
         qs = RegenerationPair.objects.select_related("user", "guest")
         q = request.query_params.get("q")
@@ -349,6 +423,16 @@ class AdminRegenListView(APIView):
 class AdminArenaListView(APIView):
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_arena_list",
+        summary="List arena preference pairs",
+        parameters=[
+            OpenApiParameter("page", int, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("page_size", int, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("q", str, OpenApiParameter.QUERY, required=False),
+        ],
+        responses={200: OpenApiTypes.OBJECT},
+    )
     def get(self, request):
         qs = (
             ArenaBattle.objects.select_related("user", "guest")
@@ -406,6 +490,19 @@ class AdminExportDPOView(APIView):
 
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_export_dpo",
+        summary="Export DPO pairs",
+        parameters=[
+            OpenApiParameter("source", str, OpenApiParameter.QUERY, required=False),
+        ],
+        responses={
+            200: OpenApiResponse(
+                response=OpenApiTypes.BINARY,
+                description="NDJSON download.",
+            )
+        },
+    )
     def get(self, request):
         source = request.query_params.get("source")
         arena_qs = None
@@ -423,6 +520,16 @@ class AdminExportDPOView(APIView):
 class AdminExportFeedbackView(APIView):
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_export_feedback",
+        summary="Export message feedback",
+        responses={
+            200: OpenApiResponse(
+                response=OpenApiTypes.BINARY,
+                description="CSV or NDJSON download.",
+            )
+        },
+    )
     def get(self, request, fmt: str):
         qs = MessageFeedback.objects.all()
         if fmt == "csv":
@@ -445,6 +552,16 @@ class AdminExportSFTView(APIView):
 
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_export_sft",
+        summary="Export SFT dataset",
+        responses={
+            200: OpenApiResponse(
+                response=OpenApiTypes.BINARY,
+                description="NDJSON download.",
+            )
+        },
+    )
     def get(self, request):
         msg_ids = MessageFeedback.objects.filter(rating="up").values_list(
             "message_id", flat=True
@@ -463,6 +580,16 @@ class AdminExportRawView(APIView):
 
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_export_raw",
+        summary="Export raw RLHF rows",
+        responses={
+            200: OpenApiResponse(
+                response=OpenApiTypes.BINARY,
+                description="NDJSON download.",
+            )
+        },
+    )
     def get(self, request, source: str):
         if source == "arena":
             rows = arena_pair_iter(
@@ -483,6 +610,17 @@ class AdminExportRawView(APIView):
 class AdminVisitorsListView(APIView):
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_visitor_list",
+        summary="List tracked visitors",
+        parameters=[
+            OpenApiParameter("page", int, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("page_size", int, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("country", str, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("q", str, OpenApiParameter.QUERY, required=False),
+        ],
+        responses={200: OpenApiTypes.OBJECT},
+    )
     def get(self, request):
         qs = GuestVisitor.objects.annotate(
             conversation_count=Count("conversations", distinct=True),
@@ -511,6 +649,11 @@ class AdminVisitorsListView(APIView):
 class AdminVisitorDetailView(APIView):
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_visitor_detail",
+        summary="Get visitor detail",
+        responses={200: AdminVisitorDetailSerializer},
+    )
     def get(self, request, visitor_key: str):
         visitor = get_object_or_404(
             GuestVisitor.objects.annotate(
@@ -525,6 +668,19 @@ class AdminVisitorDetailView(APIView):
 class AdminConversationsListView(APIView):
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_conversation_list",
+        summary="List conversations for admin review",
+        parameters=[
+            OpenApiParameter("page", int, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("page_size", int, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("owner", str, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("visitor_key", str, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("user_email", str, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("q", str, OpenApiParameter.QUERY, required=False),
+        ],
+        responses={200: OpenApiTypes.OBJECT},
+    )
     def get(self, request):
         qs = Conversation.objects.select_related("user", "guest").annotate(
             message_count=Count("messages")
@@ -558,6 +714,11 @@ class AdminConversationsListView(APIView):
 class AdminConversationDetailView(APIView):
     permission_classes = (IsStaff,)
 
+    @extend_schema(
+        operation_id="admin_rlhf_conversation_detail",
+        summary="Get conversation detail for admin review",
+        responses={200: AdminConversationSerializer},
+    )
     def get(self, request, public_id: str):
         convo = get_object_or_404(
             Conversation.objects.select_related("user", "guest").prefetch_related(

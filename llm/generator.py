@@ -89,17 +89,32 @@ ENGLISH_OVERRIDE_RE = re.compile(
 WORD_RE = re.compile(r"[a-zA-Z]+")
 
 
-def _effective_max_tokens(requested: int | None) -> int:
+def _effective_max_tokens(requested: int | None, *, model_on_cuda: bool) -> int:
     """Use shorter generations on CPU to keep shared-host chat responsive."""
-    import torch
-
     default = settings.LLM_MAX_NEW_TOKENS
     if requested is not None:
         default = requested
-    if not torch.cuda.is_available():
+    if not model_on_cuda:
         cpu_cap = int(getattr(settings, "LLM_MAX_NEW_TOKENS_CPU", 256))
         return min(default, cpu_cap)
     return default
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "cuda out of memory" in message or "cuda error: out of memory" in message
+
+
+def user_facing_generation_error(exc: BaseException) -> str:
+    if _is_cuda_oom(exc):
+        return (
+            "Sorry, the selected model is temporarily busy right now. "
+            "Please try again in a moment or switch to another model."
+        )
+    return (
+        "Sorry, I ran into a temporary problem while generating the response. "
+        "Please try again."
+    )
 
 
 def _detect_language_override(text: str) -> str | None:
@@ -189,52 +204,77 @@ def stream_completion(
     import torch
     from transformers import TextIteratorStreamer
 
-    tokenizer = loaded.tokenizer
-    model = loaded.model
+    def _stream_once(active_loaded: LoadedModel) -> Iterator[str]:
+        tokenizer = active_loaded.tokenizer
+        model = active_loaded.model
 
-    prompt = _build_prompt(loaded, messages)
-    inputs = tokenizer(prompt, return_tensors="pt")
-    try:
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-    except Exception:
-        pass
-
-    streamer = TextIteratorStreamer(
-        tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=True,
-    )
-
-    gen_kwargs: dict[str, Any] = {
-        **inputs,
-        "streamer": streamer,
-        "max_new_tokens": _effective_max_tokens(max_new_tokens),
-        "do_sample": temperature > 0,
-        "temperature": max(temperature, 1e-5),
-        "top_p": top_p,
-        "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-    }
-
-    error_box: dict[str, BaseException] = {}
-
-    def _run() -> None:
+        prompt = _build_prompt(active_loaded, messages)
+        inputs = tokenizer(prompt, return_tensors="pt")
         try:
-            with torch.inference_mode():
-                model.generate(**gen_kwargs)
-        except BaseException as exc:  # pragma: no cover - surfaced to caller
-            logger.exception("Generation error: %s", exc)
-            error_box["error"] = exc
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        except Exception:
+            pass
 
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
+        streamer = TextIteratorStreamer(
+            tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
 
-    try:
-        for token in streamer:
-            if token:
+        gen_kwargs: dict[str, Any] = {
+            **inputs,
+            "streamer": streamer,
+            "max_new_tokens": _effective_max_tokens(
+                max_new_tokens,
+                model_on_cuda=active_loaded.device_label == "cuda",
+            ),
+            "do_sample": temperature > 0,
+            "temperature": max(temperature, 1e-5),
+            "top_p": top_p,
+            "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+        }
+
+        error_box: dict[str, BaseException] = {}
+
+        def _run() -> None:
+            try:
+                with torch.inference_mode():
+                    model.generate(**gen_kwargs)
+            except BaseException as exc:  # pragma: no cover - surfaced to caller
+                logger.exception("Generation error: %s", exc)
+                error_box["error"] = exc
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+        try:
+            for token in streamer:
+                if token:
+                    yield token
+        finally:
+            thread.join(timeout=1.0)
+
+        if "error" in error_box:
+            raise error_box["error"]
+
+    emitted_any = False
+    fallback_attempted = False
+    active_loaded = loaded
+    while True:
+        try:
+            for token in _stream_once(active_loaded):
+                emitted_any = True
                 yield token
-    finally:
-        thread.join(timeout=1.0)
+            return
+        except BaseException as exc:
+            if fallback_attempted or emitted_any or not _is_cuda_oom(exc):
+                raise
+            logger.warning(
+                "CUDA OOM for model %s; retrying this response on CPU.",
+                active_loaded.key,
+            )
+            from .loader import loader
 
-    if "error" in error_box:
-        raise error_box["error"]
+            active_loaded = loader.fallback_to_cpu(active_loaded.key)
+            fallback_attempted = True

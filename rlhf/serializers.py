@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from chat.models import Conversation
@@ -161,6 +162,7 @@ class AdminConversationSerializer(serializers.ModelSerializer):
 class AdminVisitorDetailSerializer(AdminVisitorSerializer):
     conversations = serializers.SerializerMethodField()
 
+    @extend_schema_field(AdminConversationSerializer(many=True))
     def get_conversations(self, obj):
         qs = obj.conversations.order_by("-updated_at")[:50]
         return AdminConversationSerializer(qs, many=True).data

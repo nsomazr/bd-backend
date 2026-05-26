@@ -7,6 +7,8 @@ from collections.abc import Iterator
 
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.response import Response
@@ -14,8 +16,15 @@ from rest_framework.views import APIView
 
 from accounts.permissions import RequiresUserOrVisitor
 from accounts.visitors import actor_owner_kwargs, conversation_owner_q
+from bd_backend.api_schema import (
+    ArenaBattleCreateRequestSerializer,
+    ArenaVoteRequestSerializer,
+    ArenaVoteResponseSerializer,
+    LeaderboardSnapshotSerializer,
+    VISITOR_ID_HEADER,
+)
 
-from llm.generator import stream_completion
+from llm.generator import stream_completion, user_facing_generation_error
 from llm.loader import loader
 from llm.registry import MODEL_REGISTRY
 
@@ -73,6 +82,37 @@ class ArenaBattleCreateView(APIView):
     permission_classes = (RequiresUserOrVisitor,)
     renderer_classes = (ServerSentEventsRenderer, JSONRenderer)
 
+    @extend_schema(
+        summary="Create arena battle",
+        description=(
+            "Pick two random models and stream both responses over SSE. "
+            "Events include `start`, `model_loading`, `model_ready`, `token`, "
+            "`response_done`, `done`, and `error`."
+        ),
+        parameters=[VISITOR_ID_HEADER],
+        request=ArenaBattleCreateRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=OpenApiTypes.STR,
+                description="SSE stream containing both arena model outputs.",
+                examples=[
+                    OpenApiExample(
+                        "Arena SSE sample",
+                        value=(
+                            "event: start\n"
+                            'data: {"battle_id":1,"prompt":"Who can donate blood?"}\n\n'
+                            "event: token\n"
+                            'data: {"slot":"a","delta":"Hello"}\n\n'
+                            "event: response_done\n"
+                            'data: {"slot":"a","content":"Hello"}\n\n'
+                            "event: done\n"
+                            'data: {"battle_id":1,"response_a":"...","response_b":"..."}\n\n'
+                        ),
+                    )
+                ],
+            )
+        },
+    )
     def post(self, request):
         prompt = (request.data.get("prompt") or "").strip()
         if not prompt:
@@ -102,11 +142,11 @@ class ArenaBattleCreateView(APIView):
             for slot, model_key in (("a", model_a), ("b", model_b)):
                 try:
                     yield _sse({"slot": slot}, event="model_loading")
-                    loaded = loader.get(model_key)
-                    yield _sse({"slot": slot}, event="model_ready")
-                    for chunk in stream_completion(loaded, history):
-                        collected[slot].append(chunk)
-                        yield _sse({"slot": slot, "delta": chunk}, event="token")
+                    with loader.session(model_key, unload_if_idle=True) as loaded:
+                        yield _sse({"slot": slot}, event="model_ready")
+                        for chunk in stream_completion(loaded, history):
+                            collected[slot].append(chunk)
+                            yield _sse({"slot": slot, "delta": chunk}, event="token")
                     yield _sse(
                         {"slot": slot, "content": "".join(collected[slot])},
                         event="response_done",
@@ -114,7 +154,7 @@ class ArenaBattleCreateView(APIView):
                 except BaseException as exc:
                     logger.exception("Arena generation failed for slot %s", slot)
                     yield _sse(
-                        {"slot": slot, "error": str(exc)},
+                        {"slot": slot, "error": user_facing_generation_error(exc)},
                         event="error",
                     )
                     return
@@ -146,6 +186,12 @@ class ArenaBattleVoteView(APIView):
 
     permission_classes = (RequiresUserOrVisitor,)
 
+    @extend_schema(
+        summary="Vote on arena battle",
+        parameters=[VISITOR_ID_HEADER],
+        request=ArenaVoteRequestSerializer,
+        responses={200: ArenaVoteResponseSerializer},
+    )
     def post(self, request, pk: int):
         owner = conversation_owner_q(request.actor)
         battle = get_object_or_404(ArenaBattle, pk=pk, **owner)
@@ -178,6 +224,10 @@ class ArenaBattleVoteView(APIView):
 class LeaderboardView(APIView):
     permission_classes = ()
 
+    @extend_schema(
+        summary="Get leaderboard",
+        responses={200: LeaderboardSnapshotSerializer},
+    )
     def get(self, request):
         return Response(leaderboard_snapshot())
 
@@ -186,6 +236,16 @@ class LeaderboardStreamView(APIView):
     permission_classes = ()
     renderer_classes = (ServerSentEventsRenderer, JSONRenderer)
 
+    @extend_schema(
+        summary="Stream leaderboard updates",
+        description="Server-Sent Events stream of leaderboard snapshots.",
+        responses={
+            200: OpenApiResponse(
+                response=OpenApiTypes.STR,
+                description="SSE stream with leaderboard snapshots.",
+            )
+        },
+    )
     def get(self, request):
         response = StreamingHttpResponse(
             leaderboard_sse(),
